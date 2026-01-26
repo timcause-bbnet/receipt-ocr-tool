@@ -6,7 +6,7 @@ import numpy as np
 import re
 import cv2
 
-st.set_page_config(page_title="全能 OCR (V14 護照專修版)", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="全能 OCR (V15 三卡完美版)", layout="wide", page_icon="🚀")
 
 # ==========================================
 # 🔧 初始化 RapidOCR
@@ -19,7 +19,7 @@ def load_engine():
 engine = load_engine()
 
 # ==========================================
-# 🛠️ 影像處理工具 (保持 V13 設定不動)
+# 🛠️ 影像處理工具 (保持不變)
 # ==========================================
 def preprocess_red_filter(image):
     if image.mode != 'RGB':
@@ -67,7 +67,6 @@ def parse_easycard(text_lines):
             for useless in [full_date, full_date.replace("-", "/"), time_part, str(amount), "扣款", "交易", "連線"]:
                 loc_raw = loc_raw.replace(useless, "")
             loc_raw = loc_raw.strip()
-
             if "加值" in loc_raw: continue
             
             transport_type = "捷運"
@@ -87,7 +86,7 @@ def parse_easycard(text_lines):
     return data
 
 # ==========================================
-# 邏輯: 證件解析 (V14 護照修正版)
+# 邏輯: 證件解析 (V15 健保卡補完)
 # ==========================================
 def extract_id_passport_dual(img_original):
     data = {}
@@ -96,29 +95,34 @@ def extract_id_passport_dual(img_original):
     text_orig, lines_orig = run_ocr(img_original)
     clean_orig = re.sub(r'[\s\.\-\_]+', '', text_orig).upper().replace("O", "0").replace("I", "1").replace("L", "1")
 
-    # --- 類型判斷 (修正：加強護照權重) ---
+    # --- 類型判斷 (修正順序：護照 -> 健保卡 -> 身分證) ---
     doc_type = "unknown"
     
-    # 1. 先檢查是否有護照特徵 (包含 MRZ 碼 P<TWN)
+    # 1. 護照 (優先)
     if "PASSPORT" in clean_orig or "REPUBLIC" in clean_orig or "TWN" in clean_orig or "MINISTRY" in clean_orig:
         doc_type = "passport"
-    # 2. 再檢查身分證特徵
+    # 2. 【新增】健保卡 (必須在身分證之前判斷)
+    elif "全民健康保險" in clean_orig or "健保" in clean_orig:
+        doc_type = "health_card"
+    # 3. 身分證
     elif any(x in clean_orig for x in ["身分證", "出生", "性別", "統一編號"]):
         doc_type = "id_card_front"
     elif any(x in clean_orig for x in ["配偶", "役別", "父母", "鄉鎮", "市區", "住址"]):
         doc_type = "id_card_back"
-    # 3. 最後才用 ID 格式判定 (因為護照也有 ID)
+    # 4. 依照特徵猜測 (Fallback)
     elif re.search(r'[A-Z][12]\d{8}', clean_orig):
-        # 如果前面沒偵測到護照關鍵字，但有 ID，這裡要小心
-        # 為了安全，如果沒偵測到中文關鍵字，傾向猜它是護照
-        if not re.search(r'[\u4e00-\u9fa5]', clean_orig):
+        # 有身分證字號，但沒看到中文標題，這時候要小心
+        # 如果有 "NHI" 或卡號格式，也可能是健保卡
+        if re.search(r'\d{12}', clean_orig) or re.search(r'\d{4}\s\d{4}\s\d{4}', text_orig):
+             doc_type = "health_card"
+        elif not re.search(r'[\u4e00-\u9fa5]', clean_orig):
              doc_type = "passport"
         else:
              doc_type = "id_card_front"
 
     data['type_label'] = doc_type
 
-    # --- 第二掃：濾鏡圖 (只針對身分證正面，邏輯保持不動) ---
+    # --- 身分證濾鏡準備 (保持不動) ---
     text_filter, lines_filter = "", []
     if doc_type == "id_card_front":
         img_filter = preprocess_red_filter(img_original)
@@ -126,35 +130,51 @@ def extract_id_passport_dual(img_original):
 
     # === 資料提取 ===
     
-    if doc_type == "passport":
+    # --- 1. 健保卡邏輯 (新增) ---
+    if doc_type == "health_card":
+        data['type_label'] = "健保卡"
+        
+        # 姓名: 健保卡通常名字很大，且沒有"姓名"標籤
+        # 策略: 排除掉標題字，找 2-4 個字的中文
+        for line in lines_orig:
+            clean_line = re.sub(r'[^\u4e00-\u9fa5]', '', line) # 只留中文
+            if "全民" in clean_line or "保險" in clean_line or "樣本" in clean_line:
+                continue
+            if 2 <= len(clean_line) <= 4:
+                data['name'] = clean_line
+                break
+        
+        # 身分證字號
+        id_match = re.search(r'[A-Z][12]\d{8}', clean_orig)
+        data['id_no'] = id_match.group(0) if id_match else ""
+        
+        # 健保卡卡號 (12碼)
+        # 格式可能是 0000 0000 0000 或 000000000000
+        card_match = re.search(r'\d{4}\s*\d{4}\s*\d{4}', text_orig)
+        if not card_match:
+             card_match = re.search(r'\d{12}', clean_orig)
+        data['card_no'] = card_match.group(0) if card_match else ""
+
+    # --- 2. 護照邏輯 (V14 保持不動) ---
+    elif doc_type == "passport":
         data['type_label'] = "護照"
-        # 護照號碼
         pass_match = re.search(r'[0-9]{9}', clean_orig)
         data['passport_no'] = pass_match.group(0) if pass_match else ""
         
-        # 英文姓名 (修正版)
-        # 邏輯：找含有逗號的行，但要排除掉標題字
         found_name = ""
         for line in lines_orig:
-            # 必須包含逗號，且有大寫字母
             if "," in line and re.search(r'[A-Z]', line):
-                # 【關鍵修正】排除掉 "Name", "Surname", "Given", "names" 這些標題
-                # 轉大寫比對比較安全
                 line_upper = line.upper()
                 if any(bad_word in line_upper for bad_word in ["NAME", "SURNAME", "GIVEN", "MINISTRY", "REPUBLIC", "BIRTH"]):
                     continue
-                
-                # 修正 OCR 常見雜訊
                 clean_line = line.replace("1", "I").replace("|", "I").strip()
                 found_name = clean_line
                 break
-        
         data['eng_name'] = found_name
-        
         id_match = re.search(r'[A-Z][12]\d{8}', clean_orig)
         data['id_no'] = id_match.group(0) if id_match else ""
 
-    # === 以下身分證邏輯完全保持 V13 設定 (DO NOT TOUCH) ===
+    # --- 3. 身分證邏輯 (V13/V14 保持不動) ---
     elif doc_type == "id_card_front":
         data['type_label'] = "身分證 (正面)"
         id_match = re.search(r'[A-Z][12]\d{8}', clean_orig)
@@ -169,14 +189,11 @@ def extract_id_passport_dual(img_original):
             return ""
 
         name_candidate = find_name(lines_filter) 
-        if not name_candidate:
-            name_candidate = find_name(lines_orig) 
-            
+        if not name_candidate: name_candidate = find_name(lines_orig) 
         data['name'] = name_candidate.replace("樣本", "").replace("樣", "").replace("本", "").strip()
 
         dob_match = re.search(r'民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text_orig)
-        if not dob_match: 
-             dob_match = re.search(r'民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text_filter)
+        if not dob_match: dob_match = re.search(r'民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text_filter)
         data['dob'] = dob_match.group(0) if dob_match else ""
 
     elif doc_type == "id_card_back":
@@ -192,7 +209,6 @@ def extract_id_passport_dual(img_original):
         m_match = re.search(r'母\s*([\u4e00-\u9fa5]+)', parents_line)
         data['father'] = f_match.group(1) if f_match else ""
         data['mother'] = m_match.group(1) if m_match else ""
-        
         spouse_line = "".join([l for l in lines_orig if "配偶" in l])
         data['spouse'] = spouse_line.replace("配偶", "")
 
@@ -248,15 +264,14 @@ if app_mode == "💳 悠遊卡報表":
             hide_index=True,
             use_container_width=True
         )
-        
         if st.button("產生 HTML"):
             final_data = edited_df[edited_df["選取"] == True]
             html = final_data.to_html(classes='table', index=False)
             st.download_button("下載報表", html, "report.html")
 
 else:
-    st.title("🪪 智慧證件辨識 (V14)")
-    st.info("💡 護照誤判與姓名抓取修正版。身分證功能保持不變。")
+    st.title("🪪 智慧證件辨識 (V15 三卡合一)")
+    st.info("💡 完美支援：身分證 (正/反)、護照、健保卡 (自動判斷)。")
     
     uploaded_file = st.file_uploader("上傳證件", type=['png', 'jpg', 'jpeg'])
     
@@ -277,10 +292,16 @@ else:
                 
                 with st.form("result"):
                     c1, c2 = st.columns(2)
+                    
                     if doc_label == "護照":
                         c1.text_input("英文姓名", data.get('eng_name', ''))
                         c2.text_input("護照號碼", data.get('passport_no', ''))
                         st.text_input("身分證字號", data.get('id_no', ''))
+                    
+                    elif doc_label == "健保卡":
+                        c1.text_input("姓名", data.get('name', ''))
+                        c2.text_input("身分證字號", data.get('id_no', ''))
+                        st.text_input("健保卡號 (12碼)", data.get('card_no', ''))
                     
                     elif doc_label == "身分證 (正面)":
                         c1.text_input("姓名", data.get('name', ''))
