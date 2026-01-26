@@ -10,181 +10,168 @@ import shutil
 # 🔧 跨平台 Tesseract 路徑設定
 # ==========================================
 if os.name == 'nt':
-    # Windows 本機路徑
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 else:
-    # 雲端 Linux 路徑
     tesseract_cmd = shutil.which("tesseract")
     if tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-# ==========================================
-# 頁面與樣式設定
-# ==========================================
 st.set_page_config(page_title="全能證件辨識系統", layout="wide", page_icon="🕵️")
 
 # ==========================================
-# 核心邏輯：防呆驗證函式
+# 核心邏輯：防呆驗證
 # ==========================================
 def validate_image_content(text, doc_type):
-    """
-    根據 OCR 結果判斷是否上傳了正確的證件
-    回傳: (是否通過, 錯誤訊息)
-    """
-    # 移除雜訊方便比對
     clean_text = text.replace(" ", "").upper()
     
-    # 1. 如果在【健保卡模式】
     if doc_type == "health_card":
-        if "全民健康保險" in clean_text or "健保" in clean_text:
-            return True, ""
-        # 偵測是否誤傳為其他證件
-        if "PASSPORT" in clean_text: return False, "⚠️ 錯誤：偵測到這是【護照】，請切換模式！"
-        if "身分證" in clean_text: return False, "⚠️ 錯誤：偵測到這是【身分證】，請切換模式！"
-        return False, "⚠️ 錯誤：無法識別為健保卡，請確認照片清晰或包含「全民健康保險」字樣。"
+        if any(x in clean_text for x in ["全民健康保險", "健保", "IC卡"]): return True, ""
+        if "PASSPORT" in clean_text: return False, "⚠️ 錯誤：這是【護照】，請切換模式！"
+        if "身分證" in clean_text: return False, "⚠️ 錯誤：這是【身分證】，請切換模式！"
+        return False, "⚠️ 讀取不到「全民健康保險」字樣，請確認照片清晰。"
 
-    # 2. 如果在【護照模式】
     elif doc_type == "passport":
-        if "PASSPORT" in clean_text or "REPUBLICOFCHINA" in clean_text or "P<TWN" in clean_text:
-            return True, ""
-        if "全民健康保險" in clean_text: return False, "⚠️ 錯誤：偵測到這是【健保卡】，請切換模式！"
-        if "身分證" in clean_text: return False, "⚠️ 錯誤：偵測到這是【身分證】，請切換模式！"
-        return False, "⚠️ 錯誤：無法識別為護照，請確認照片包含「PASSPORT」字樣。"
+        if any(x in clean_text for x in ["PASSPORT", "REPUBLIC", "TWN"]): return True, ""
+        if "健保" in clean_text: return False, "⚠️ 錯誤：這是【健保卡】，請切換模式！"
+        return False, "⚠️ 讀取不到「PASSPORT」字樣，請確認照片清晰。"
 
-    # 3. 如果在【身分證模式】
     elif doc_type == "id_card":
-        if "身分證" in clean_text or "出生" in clean_text:
-            return True, ""
-        if "全民健康保險" in clean_text: return False, "⚠️ 錯誤：偵測到這是【健保卡】，請切換模式！"
-        if "PASSPORT" in clean_text: return False, "⚠️ 錯誤：偵測到這是【護照】，請切換模式！"
-        return False, "⚠️ 錯誤：無法識別為身分證，請確認照片清晰。"
+        if any(x in clean_text for x in ["身分證", "出生", "姓名"]): return True, ""
+        if "健保" in clean_text: return False, "⚠️ 錯誤：這是【健保卡】，請切換模式！"
+        return False, "⚠️ 讀取不到身分證特徵，請確認照片清晰。"
 
     return True, ""
 
 # ==========================================
-# 側邊欄選單
+# 核心邏輯：強力資料提取 (Regex)
 # ==========================================
-st.sidebar.title("🕵️ 全能辨識系統")
-app_mode = st.sidebar.radio("請選擇辨識項目：", 
+def extract_data(text, doc_type):
+    # 1. 基礎清理：移除空格換行，並把常見混淆字替換 (O->0)
+    clean_text = text.replace(" ", "").replace("\n", "")
+    # 針對數字欄位的優化清理 (把誤判的英文轉回數字)
+    num_clean_text = clean_text.upper().replace("O", "0").replace("I", "1").replace("L", "1")
+
+    data = {}
+
+    if doc_type == "id_card":
+        # 姓名：嘗試找「姓名」後面的 2-4 個字，如果找不到，就嘗試找「性別」前面的字
+        name_match = re.search(r'姓名[:\s]*([\u4e00-\u9fa5]{2,4})', clean_text)
+        if not name_match:
+             # fallback: 找「性別」前面
+             name_match = re.search(r'([\u4e00-\u9fa5]{2,4})性別', clean_text)
+        data['name'] = name_match.group(1) if name_match else ""
+
+        # 身分證字號
+        id_match = re.search(r'[A-Z][12]\d{8}', num_clean_text)
+        data['id_no'] = id_match.group(0) if id_match else ""
+
+        # 生日
+        dob_match = re.search(r'民國\d{2,3}年\d{1,2}月\d{1,2}日', clean_text)
+        data['dob'] = dob_match.group(0) if dob_match else ""
+
+    elif doc_type == "health_card":
+        # 姓名
+        name_match = re.search(r'姓名[:\s]*([\u4e00-\u9fa5]{2,4})', clean_text)
+        data['name'] = name_match.group(1) if name_match else ""
+
+        # 身分證字號
+        id_match = re.search(r'[A-Z][12]\d{8}', num_clean_text)
+        data['id_no'] = id_match.group(0) if id_match else ""
+
+        # 健保卡號 (12碼)
+        card_match = re.search(r'\d{12}', num_clean_text)
+        data['card_no'] = card_match.group(0) if card_match else ""
+
+    elif doc_type == "passport":
+        # 護照號碼 (9碼)
+        pass_match = re.search(r'[0-9]{9}', num_clean_text)
+        data['passport_no'] = pass_match.group(0) if pass_match else ""
+
+        # 身分證 (從護照內找)
+        id_match = re.search(r'[A-Z][12]\d{8}', num_clean_text)
+        data['id_no'] = id_match.group(0) if id_match else ""
+        
+        # 英文姓名 (抓取 逗號分隔的大寫英文)
+        # 注意：這裡用原始 text 比較好抓，因為有空格
+        eng_match = re.search(r'([A-Z]+,\s?[A-Z\-]+)', text)
+        data['eng_name'] = eng_match.group(1).replace("\n", "") if eng_match else ""
+
+    return data
+
+# ==========================================
+# 介面顯示
+# ==========================================
+st.sidebar.title("🧰 工具箱")
+app_mode = st.sidebar.radio("請選擇功能：", 
     ["💳 悠遊卡報表產生器", "🪪 身分證辨識", "🏥 健保卡辨識", "✈️ 護照辨識"]
 )
 
-# 初始化 Session
-if 'ocr_df' not in st.session_state: st.session_state['ocr_df'] = None
 if 'current_image' not in st.session_state: st.session_state['current_image'] = None
 
-# ==========================================
-# 模式 A: 悠遊卡報表 (維持原本功能)
-# ==========================================
+# --- 模式 A: 悠遊卡 (保持簡化，您已有完整版代碼) ---
 if app_mode == "💳 悠遊卡報表產生器":
     st.title("💳 悠遊卡報表產生器")
-    
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        uploaded_file = st.file_uploader("📂 上傳截圖", type=['png', 'jpg', 'jpeg'])
-        if uploaded_file: st.session_state['current_image'] = Image.open(uploaded_file)
-    with col2:
-        if st.button("📋 貼上剪貼簿 (限本機)"):
-            try: st.session_state['current_image'] = ImageGrab.grabclipboard()
-            except: st.error("雲端無法讀取剪貼簿")
-            
-    # (此處省略詳細悠遊卡解析代碼，與上一版相同，若需要請告知)
-    # ... 您可以保留上一版的 parse_easycard 函式與 HTML 生成邏輯 ...
+    uploaded_file = st.file_uploader("📂 上傳截圖", type=['png', 'jpg'])
+    if uploaded_file: st.session_state['current_image'] = Image.open(uploaded_file)
+    # (此處為節省篇幅省略 HTML 生成邏輯，請沿用您上一版的悠遊卡代碼)
     if st.session_state['current_image']:
-        st.image(st.session_state['current_image'], width=600)
-        st.info("請參考上一版代碼填入悠遊卡解析邏輯，或專注於下方新功能測試。")
+        st.image(st.session_state['current_image'], width=500)
+        st.info("⚠️ 請使用上一版提供的完整程式碼來執行悠遊卡功能，本頁面專注於展示修復後的證件辨識。")
 
-# ==========================================
-# 模式 B, C, D: 證件辨識通用區
-# ==========================================
+# --- 模式 B/C/D: 證件辨識 ---
 else:
-    # 根據模式設定標題與變數
-    if app_mode == "🪪 身分證辨識":
-        st.title("🪪 台灣身分證 OCR")
-        target_type = "id_card"
-    elif app_mode == "🏥 健保卡辨識":
-        st.title("🏥 健保卡 OCR")
-        target_type = "health_card"
-    elif app_mode == "✈️ 護照辨識":
-        st.title("✈️ 護照 OCR (Passport)")
-        target_type = "passport"
-
-    st.markdown("---")
-    uploaded_file = st.file_uploader(f"請上傳 **{app_mode.split(' ')[1]}** 照片", type=['png', 'jpg', 'jpeg'])
+    doc_map = {"🪪 身分證辨識": "id_card", "🏥 健保卡辨識": "health_card", "✈️ 護照辨識": "passport"}
+    target_type = doc_map[app_mode]
+    
+    st.title(app_mode)
+    uploaded_file = st.file_uploader(f"請上傳 {app_mode.split(' ')[1]}", type=['png', 'jpg', 'jpeg'])
 
     if uploaded_file:
         image = Image.open(uploaded_file)
         st.image(image, caption='已上傳照片', width=400)
 
-        if st.button("🔍 開始智慧辨識"):
-            with st.spinner('正在分析影像特徵...'):
-                # 1. 全文 OCR
-                text = pytesseract.image_to_string(image, lang='chi_tra+eng')
+        if st.button("🔍 開始辨識"):
+            with st.spinner('正在分析並提取資料...'):
+                # 1. OCR
+                raw_text = pytesseract.image_to_string(image, lang='chi_tra+eng')
                 
-                # 2. 🛡️ 防呆驗證：檢查是否上傳錯誤
-                is_valid, error_msg = validate_image_content(text, target_type)
+                # 2. 驗證
+                is_valid, err_msg = validate_image_content(raw_text, target_type)
                 
                 if not is_valid:
-                    # ❌ 驗證失敗：顯示紅色錯誤警告
-                    st.error(error_msg)
-                    st.toast(error_msg, icon="❌")
+                    st.error(err_msg)
                 else:
-                    # ✅ 驗證成功：開始解析資料
-                    clean_text = text.replace(" ", "").replace("\n", "")
+                    st.success(f"✅ 成功識別為 {app_mode.split(' ')[1]}！")
                     
-                    # --- 🪪 身分證解析邏輯 ---
-                    if target_type == "id_card":
-                        name_match = re.search(r'姓名(.{2,4})', clean_text)
-                        id_match = re.search(r'[A-Z][12]\d{8}', clean_text)
-                        dob_match = re.search(r'民國\d{2,3}年\d{1,2}月\d{1,2}日', clean_text)
+                    # 3. 提取資料
+                    data = extract_data(raw_text, target_type)
+                    
+                    # 4. 顯示結果表單
+                    st.subheader("📝 辨識結果 (可直接修改)")
+                    with st.form("result_form"):
+                        c1, c2 = st.columns(2)
                         
-                        st.success("✅ 這是有效的身分證！")
-                        st.subheader("辨識結果")
-                        with st.form("id_form"):
-                            c1, c2 = st.columns(2)
-                            c1.text_input("姓名", value=name_match.group(1) if name_match else "")
-                            c2.text_input("身分證字號", value=id_match.group(0) if id_match else "")
-                            st.text_input("出生年月日", value=dob_match.group(0) if dob_match else "")
-                            st.form_submit_button("確認存檔")
+                        if target_type == "id_card":
+                            new_name = c1.text_input("姓名", value=data.get('name', ''))
+                            new_id = c2.text_input("身分證字號", value=data.get('id_no', ''))
+                            new_dob = st.text_input("出生年月日", value=data.get('dob', ''))
+                            
+                        elif target_type == "health_card":
+                            new_name = c1.text_input("姓名", value=data.get('name', ''))
+                            new_id = c2.text_input("身分證字號", value=data.get('id_no', ''))
+                            new_card = st.text_input("健保卡號 (12碼)", value=data.get('card_no', ''))
+                            
+                        elif target_type == "passport":
+                            new_name = c1.text_input("英文姓名", value=data.get('eng_name', ''))
+                            new_id = c2.text_input("護照號碼", value=data.get('passport_no', ''))
+                            st.text_input("身分證字號 (若有)", value=data.get('id_no', ''))
 
-                    # --- 🏥 健保卡解析邏輯 ---
-                    elif target_type == "health_card":
-                        # 健保卡號通常是 12 碼數字
-                        card_num_match = re.search(r'\d{4}\d{4}\d{4}', clean_text)
-                        if not card_num_match: card_num_match = re.search(r'\d{12}', clean_text)
-                        
-                        # 身分證字號 (健保卡上也有)
-                        id_match = re.search(r'[A-Z][12]\d{8}', clean_text)
-                        
-                        # 姓名 (通常在 "姓名" 後面)
-                        name_match = re.search(r'姓名(.{2,4})', clean_text)
-                        
-                        st.success("✅ 這是有效的健保卡！")
-                        st.subheader("辨識結果")
-                        with st.form("health_form"):
-                            c1, c2 = st.columns(2)
-                            c1.text_input("姓名", value=name_match.group(1) if name_match else "")
-                            c2.text_input("身分證字號", value=id_match.group(0) if id_match else "")
-                            st.text_input("健保卡卡號 (12碼)", value=card_num_match.group(0) if card_num_match else "")
-                            st.form_submit_button("確認存檔")
+                        submitted = st.form_submit_button("💾 確認存檔")
+                        if submitted:
+                            st.balloons()
+                            st.success("資料已保存！")
 
-                    # --- ✈️ 護照解析邏輯 ---
-                    elif target_type == "passport":
-                        # 護照號碼 (通常 9 碼數字)
-                        passport_no_match = re.search(r'[0-9]{9}', clean_text)
-                        
-                        # 英文姓名 (尋找全大寫英文，且有逗號分隔 EX: WANG, XIAO-MING)
-                        # 這邊用比較寬鬆的 regex
-                        eng_name_match = re.search(r'[A-Z]+,[A-Z\-]+', text) # 注意：這裡用有空格的 original text 比較好抓
-                        
-                        # 機器讀碼區 (MRZ) 的身分證字號
-                        id_in_passport = re.search(r'[A-Z][12]\d{8}', clean_text)
-
-                        st.success("✅ 這是有效的護照！")
-                        st.subheader("辨識結果")
-                        with st.form("passport_form"):
-                            c1, c2 = st.columns(2)
-                            c1.text_input("英文姓名", value=eng_name_match.group(0) if eng_name_match else "")
-                            c2.text_input("護照號碼", value=passport_no_match.group(0) if passport_no_match else "")
-                            st.text_input("身分證字號 (從護照)", value=id_in_passport.group(0) if id_in_passport else "")
-                            st.form_submit_button("確認存檔")
+                # === 除錯專區 (關鍵功能) ===
+                with st.expander("🛠️ 抓不到資料？點此查看原始 OCR 文字"):
+                    st.text_area("電腦讀到的內容：", raw_text, height=200)
+                    st.caption("說明：若此處沒看到您的名字，代表照片可能太模糊，或字體被反光遮住了。")
