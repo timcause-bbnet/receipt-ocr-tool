@@ -1,4 +1,6 @@
 streamlit
-pytesseract
+rapidocr-onnxruntime
+opencv-python-headless
 pandas
 pillow
+numpy

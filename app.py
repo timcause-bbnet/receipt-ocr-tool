@@ -1,276 +1,271 @@
 import streamlit as st
-import pytesseract
-from PIL import Image, ImageEnhance, ImageOps
+# 改用 RapidOCR (ONNXRuntime版)，輕量又強大
+from rapidocr_onnxruntime import RapidOCR
+from PIL import Image, ImageGrab, ImageEnhance, ImageOps
 import pandas as pd
+import numpy as np
 import re
-import os
-import shutil
+import cv2
+
+st.set_page_config(page_title="全能 OCR (V12 RapidOCR版)", layout="wide", page_icon="🚀")
 
 # ==========================================
-# 🔧 Tesseract 路徑設定
+# 🔧 初始化 RapidOCR
 # ==========================================
-if os.name == 'nt':
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-else:
-    tesseract_cmd = shutil.which("tesseract")
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+@st.cache_resource
+def load_engine():
+    # det_use_cuda=False (雲端只有 CPU)
+    # 第一次執行會自動下載輕量模型 (約 10MB)，非常快
+    engine = RapidOCR()
+    return engine
 
-st.set_page_config(page_title="全能證件辨識 (V10.5 樣本修正版)", layout="wide", page_icon="🛠️")
-
-# ==========================================
-# 🛠️ 關鍵功能：錯字自動修正 (針對樣本圖)
-# ==========================================
-def auto_correct_common_errors(text, doc_type):
-    """
-    針對網路常見樣本圖的 OCR 錯誤進行硬修正
-    """
-    corrected_text = text
-    
-    if doc_type == "passport":
-        # 修正 Tesseract 常把 LIN 誤判為 RAL, UN, IIN 等
-        # 邏輯：只要看到 "RAL, MEI" 就改成 "LIN, MEI"
-        corrected_text = corrected_text.replace("RAL,", "LIN,")
-        corrected_text = corrected_text.replace("UN,", "LIN,")
-        corrected_text = corrected_text.replace("IIN,", "LIN,")
-        corrected_text = corrected_text.replace("L1N,", "LIN,")
-        
-        # 修正樣本護照常見的號碼誤判
-        corrected_text = corrected_text.replace("888800371", "888800371") # 確保樣本號碼正確
-
-    elif doc_type == "id_card":
-        # 修正樣本姓名 "陳筱玲" 常見的誤判
-        # 有時候 "筱" 會被讀成 "俊" 或其他字
-        if "陳" in corrected_text and "玲" in corrected_text:
-            # 如果中間那個字怪怪的，可以考慮強制修正，但在這裡我們先保留原樣
-            pass
-            
-    return corrected_text
+engine = load_engine()
 
 # ==========================================
-# 📷 影像預處理 (V10 紅光濾鏡 + Gamma)
+# 🛠️ 輔助工具：把 RapidOCR 結果轉成文字
 # ==========================================
-def preprocess_image(image):
+def run_ocr(image):
+    # 轉換 PIL Image -> OpenCV 格式 (numpy)
     if image.mode != 'RGB':
         image = image.convert('RGB')
-        
-    # 1. 取紅色通道 (過濾印章)
-    r, g, b = image.split()
+    img_np = np.array(image)
+    # RGB -> BGR (因為 OpenCV 吃 BGR)
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    # 2. Gamma 校正 (加粗文字)
+    # 執行辨識
+    result, elapse = engine(img_cv)
+    
+    if not result:
+        return "", []
+        
+    # result 結構: [[座標], '文字', 信心度]
+    # 我們把它接成一個大字串，模擬以前 Tesseract 的輸出，方便 Regex 處理
+    all_text = "\n".join([line[1] for line in result])
+    raw_lines = [line[1] for line in result]
+    
+    return all_text, raw_lines
+
+# ==========================================
+# 📷 影像預處理 (Gamma 加粗 - 選用)
+# ==========================================
+def preprocess_image_gamma(image):
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    # 分離紅色通道 (過濾印章)
+    r, g, b = image.split()
+    # Gamma 加粗 (讓被洗淡的字變黑)
     def gamma_correction(pixel_val):
         return int(255 * (pixel_val / 255) ** 0.6)
     img_gamma = r.point(gamma_correction)
-    
-    # 3. 放大 2 倍
-    new_size = (int(r.width * 2), int(r.height * 2))
-    img_resized = img_gamma.resize(new_size, Image.Resampling.LANCZOS)
-    
-    # 4. 對比度增強
-    enhancer = ImageEnhance.Contrast(img_resized)
-    img_final = enhancer.enhance(2.0)
-    
-    return img_final
+    return img_gamma
 
 # ==========================================
-# 核心邏輯：防呆驗證
+# 邏輯 1: 悠遊卡解析 (復活版)
 # ==========================================
-def validate_image_content(text, doc_type):
-    clean_text = re.sub(r'\s+', '', text).upper()
-    
-    if doc_type == "health_card":
-        if any(x in clean_text for x in ["全民健康保險", "健保", "IC卡"]): return True, "health_card"
-        if "PASSPORT" in clean_text: return False, "⚠️ 錯誤：這是【護照】"
-        if "父母" in clean_text: return False, "⚠️ 錯誤：這是【身分證背面】"
-        return False, "⚠️ 讀取不到健保卡特徵"
-
-    elif doc_type == "passport":
-        if any(x in clean_text for x in ["PASSPORT", "REPUBLIC", "TWN"]): return True, "passport"
-        if "健保" in clean_text: return False, "⚠️ 錯誤：這是【健保卡】"
-        return False, "⚠️ 讀取不到護照特徵"
-
-    elif doc_type == "id_card":
-        # 放行身分證字號
-        if re.search(r'[A-Z][12]\d{8}', clean_text): return True, "id_card_front"
-
-        front_keywords = ["身", "分", "證", "出", "生", "性", "別", "統", "一", "編", "號", "民", "國"]
-        back_keywords = ["配", "偶", "役", "別", "父", "母", "鄉", "鎮", "鄰", "里", "區", "路", "街", "巷", "樓"]
+def parse_easycard(text_lines):
+    data = []
+    # 針對每一行文字進行分析
+    for line in text_lines:
+        line = line.strip()
+        # Regex 找日期時間 + 金額
+        # RapidOCR 斷句比較準，通常一行就是一筆
+        # 尋找: 2025-xx-xx 或 2025/xx/xx
+        date_match = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})', line)
+        time_match = re.search(r'(\d{2}:\d{2}:\d{2})', line)
+        amount_match = re.search(r'[-]?\d+', line[::-1]) # 從後面找金額
         
-        front_score = sum(1 for k in front_keywords if k in clean_text)
-        back_score = sum(1 for k in back_keywords if k in clean_text)
-        
-        if front_score >= 2: return True, "id_card_front"
-        if back_score >= 2: return True, "id_card_back"
+        if date_match and time_match:
+            full_date = date_match.group(1).replace("/", "-")
+            time_part = time_match.group(1)
             
-        if "健保" in clean_text: return False, "⚠️ 錯誤：這是【健保卡】"
-        
-        if len(clean_text) > 5:
-             return False, f"⚠️ 特徵不足。請確認是否為樣本圖干擾。"
-        return False, "⚠️ 讀不到文字"
+            # 金額處理 (反轉回來)
+            amount = 0
+            if amount_match:
+                amt_str = amount_match.group(0)[::-1]
+                amount = amt_str
+            
+            # 地點處理 (移除日期、時間、金額、扣款等字眼)
+            loc_raw = line
+            for useless in [full_date, full_date.replace("-", "/"), time_part, str(amount), "扣款", "交易", "連線"]:
+                loc_raw = loc_raw.replace(useless, "")
+            loc_raw = loc_raw.strip()
 
-    return True, doc_type
+            if "加值" in loc_raw: continue
+            
+            transport_type = "捷運"
+            if "台鐵" in loc_raw: transport_type = "台鐵"
+            elif "客運" in loc_raw: transport_type = "客運"
+            elif "高鐵" in loc_raw: transport_type = "高鐵"
+            elif "路" in loc_raw or "車" in loc_raw: transport_type = "公車"
+
+            data.append({
+                "選取": True,
+                "完整日期": f"{full_date} {time_part}",
+                "短日期": full_date[5:].replace("-", "/"),
+                "交通": transport_type,
+                "訖點": loc_raw,
+                "金額": str(amount).replace("-", "")
+            })
+    return data
 
 # ==========================================
-# 核心邏輯：資料提取
+# 邏輯 2: 證件解析 (RapidOCR版)
 # ==========================================
-def extract_data(text, doc_type, specific_type=None):
-    # 【關鍵步驟】先執行自動修正
-    text = auto_correct_common_errors(text, doc_type)
-    
-    raw_text = text
-    clean_text_nospace = re.sub(r'[\s\.\-\_]+', '', text).upper().replace("O", "0").replace("I", "1").replace("L", "1")
+def extract_id_passport(all_text, raw_lines, doc_type):
+    # 移除空格方便找 ID
+    clean_text = re.sub(r'[\s\.\-\_]+', '', all_text).upper().replace("O", "0").replace("I", "1").replace("L", "1")
     data = {}
 
-    if doc_type == "id_card":
-        if specific_type == "id_card_front":
-            # 姓名
-            name_match = re.search(r'姓\s*名[:\s\.]*([\u4e00-\u9fa5\s]{2,10})', raw_text)
-            if name_match:
-                raw_name = name_match.group(1).replace(" ", "").replace("\n", "")
-                data['name'] = raw_name.replace("樣本", "").replace("樣", "").replace("本", "").replace("圈", "").replace("胡", "")
-            else:
-                lines = raw_text.split('\n')
-                found_name = ""
-                for line in lines[:8]:
-                    c_line = re.sub(r'[^\u4e00-\u9fa5]', '', line) 
-                    if 2 <= len(c_line) <= 4 and "中華" not in c_line and "身分" not in c_line:
-                        found_name = c_line
-                        break
-                data['name'] = found_name.replace("樣本", "").replace("圈", "")
+    if doc_type == "passport":
+        data['type_label'] = "護照"
+        # 護照號碼
+        pass_match = re.search(r'[0-9]{9}', clean_text)
+        data['passport_no'] = pass_match.group(0) if pass_match else ""
+        # 英文姓名 (RapidOCR 讀英文很準)
+        # 找全大寫且有逗號的行
+        for line in raw_lines:
+            if "," in line and re.search(r'[A-Z]', line):
+                if "MINISTRY" not in line and "REPUBLIC" not in line:
+                     data['eng_name'] = line
+                     break
+        # 身分證字號
+        id_match = re.search(r'[A-Z][12]\d{8}', clean_text)
+        data['id_no'] = id_match.group(0) if id_match else ""
 
-            # ID
-            id_match = re.search(r'[A-Z][12]\d{8}', clean_text_nospace)
-            data['id_no'] = id_match.group(0) if id_match else ""
-
-            # 生日
-            date_pattern = r'(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日'
-            all_dates = []
-            for match in re.finditer(date_pattern, raw_text):
-                y, m, d = match.groups()
-                if 10 < int(y) < 150:
-                    all_dates.append({
-                        "str": f"民國{y}年{m}月{d}日",
-                        "val": int(y)*10000 + int(m)*100 + int(d)
-                    })
-            if all_dates:
-                all_dates.sort(key=lambda x: x['val'])
-                data['dob'] = all_dates[0]['str']
-            else:
-                data['dob'] = ""
-            data['type_label'] = "身分證 (正面)"
-
-        elif specific_type == "id_card_back":
-            # 住址
-            addr_match = re.search(r'址[:\s\.]*([\u4e00-\u9fa50-9\-\(\)鄰里巷弄號樓\s]+)', raw_text)
-            if addr_match:
-                data['address'] = addr_match.group(1).replace(" ", "").replace("\n", "")
-            else:
-                scan = re.search(r'[\u4e00-\u9fa5]+[縣市][\u4e00-\u9fa5]+[區鄉鎮市][\u4e00-\u9fa50-9]+', clean_text_nospace)
-                data['address'] = scan.group(0) if scan else ""
-            # 父母/配偶
-            spouse_match = re.search(r'偶[:\s\.]*([\u4e00-\u9fa5\s]{2,5})', raw_text)
-            if spouse_match:
-                sp = spouse_match.group(1).replace(" ", "")
-                data['spouse'] = sp if "役" not in sp else ""
-            f_match = re.search(r'父([\u4e00-\u9fa5]{2,4})', clean_text_nospace)
-            m_match = re.search(r'母([\u4e00-\u9fa5]{2,4})', clean_text_nospace)
+    elif doc_type == "id_card":
+        # 判斷正反面
+        is_back = any(x in clean_text for x in ["配偶", "役別", "父母", "鄉鎮", "市區", "住址"])
+        
+        if is_back:
+            data['type_label'] = "身分證 (背面)"
+            # 住址: 找含有縣/市/區/路的行
+            addr = ""
+            for line in raw_lines:
+                if any(k in line for k in ["縣", "市", "區", "路", "街", "里", "鄰"]):
+                    addr += line
+            data['address'] = addr.replace("住址", "")
+            
+            # 父母/配偶: 簡單關鍵字抓取
+            parents_line = "".join([l for l in raw_lines if "父" in l or "母" in l])
+            f_match = re.search(r'父\s*([\u4e00-\u9fa5]+)', parents_line)
+            m_match = re.search(r'母\s*([\u4e00-\u9fa5]+)', parents_line)
             data['father'] = f_match.group(1) if f_match else ""
             data['mother'] = m_match.group(1) if m_match else ""
-            data['type_label'] = "身分證 (背面)"
-
-    elif doc_type == "health_card":
-        name_match = re.search(r'姓\s*名[:\s]*([\u4e00-\u9fa5\s]{2,10})', raw_text)
-        if name_match: data['name'] = name_match.group(1).replace(" ", "")
-        id_match = re.search(r'[A-Z][12]\d{8}', clean_text_nospace)
-        data['id_no'] = id_match.group(0) if id_match else ""
-        card_match = re.search(r'\d{12}', clean_text_nospace)
-        data['card_no'] = card_match.group(0) if card_match else ""
-        data['type_label'] = "健保卡"
-
-    elif doc_type == "passport":
-        pass_match = re.search(r'[0-9]{9}', clean_text_nospace)
-        id_match = re.search(r'[A-Z][12]\d{8}', clean_text_nospace)
-        
-        # 英文姓名 (貪婪抓取)
-        eng_match = re.search(r'([A-Z]+,\s*.*)', raw_text)
-        if eng_match:
-            raw_eng = eng_match.group(1)
-            # 允許 A-Z, 逗號, 連字號, 空格
-            clean_eng = re.sub(r'[^A-Z,\-\s]', '', raw_eng).strip()
-            # 再次修正：如果修正後變成 LIN MEI-HUA (沒逗號)，補上逗號
-            if "," not in clean_eng and "LIN" in clean_eng:
-                clean_eng = clean_eng.replace("LIN", "LIN,")
-            data['eng_name'] = clean_eng
+            
+            spouse_line = "".join([l for l in raw_lines if "配偶" in l])
+            data['spouse'] = spouse_line.replace("配偶", "")
+            
         else:
-             data['eng_name'] = ""
+            data['type_label'] = "身分證 (正面)"
+            # 姓名: 找 "姓名" 附近的字
+            for i, line in enumerate(raw_lines):
+                if "姓名" in line:
+                    potential_name = line.replace("姓名", "").strip()
+                    if len(potential_name) > 1:
+                        data['name'] = potential_name
+                    elif i+1 < len(raw_lines):
+                        data['name'] = raw_lines[i+1]
+                    break
+            # 去除樣本字樣
+            if 'name' in data:
+                data['name'] = data['name'].replace("樣本", "").replace("樣", "").replace("本", "")
 
-        data['passport_no'] = pass_match.group(0) if pass_match else ""
-        data['id_no'] = id_match.group(0) if id_match else ""
-        data['type_label'] = "護照"
+            # ID
+            id_match = re.search(r'[A-Z][12]\d{8}', clean_text)
+            data['id_no'] = id_match.group(0) if id_match else ""
+            
+            # 生日
+            dob_match = re.search(r'民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', all_text)
+            data['dob'] = dob_match.group(0) if dob_match else ""
 
     return data
 
 # ==========================================
 # 介面顯示
 # ==========================================
-st.sidebar.title("🧰 工具箱")
-app_mode = st.sidebar.radio("請選擇功能：", ["💳 悠遊卡報表產生器", "🪪 身分證辨識", "🏥 健保卡辨識", "✈️ 護照辨識"])
+st.sidebar.title("🚀 RapidOCR 工具箱")
+app_mode = st.sidebar.radio("功能選單", ["💳 悠遊卡報表", "🪪 證件辨識 (身分證/護照)"])
 
-doc_map = {"🪪 身分證辨識": "id_card", "🏥 健保卡辨識": "health_card", "✈️ 護照辨識": "passport"}
+if 'ocr_df' not in st.session_state: st.session_state['ocr_df'] = None
 
-if app_mode == "💳 悠遊卡報表產生器":
-    st.title("💳 悠遊卡報表產生器")
-    st.info("請使用舊版程式碼。")
+# --- 功能 1: 悠遊卡 (完全回歸) ---
+if app_mode == "💳 悠遊卡報表":
+    st.title("💳 悠遊卡報表產生器 (RapidOCR版)")
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        uploaded_file = st.file_uploader("📂 上傳截圖", type=['png', 'jpg', 'jpeg'])
+        if uploaded_file:
+            image = Image.open(uploaded_file)
+            st.image(image, width=500)
+            if st.button("🚀 開始辨識", key="btn_easy"):
+                full_text, lines = run_ocr(image)
+                # 解析
+                parsed_data = parse_easycard(lines)
+                if parsed_data:
+                    st.session_state['ocr_df'] = pd.DataFrame(parsed_data)
+                else:
+                    st.error("無法辨識資料，請確認截圖是否清晰。")
+                    st.text(full_text) # debug
+
+    if st.session_state['ocr_df'] is not None:
+        st.subheader("👇 編輯資料")
+        edited_df = st.data_editor(
+            st.session_state['ocr_df'],
+            column_config={
+                "選取": st.column_config.CheckboxColumn("列入", width="small"),
+                "交通": st.column_config.SelectboxColumn("交通", options=["捷運", "台鐵", "高鐵", "公車", "計程車"]),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        if st.button("產生 HTML"):
+            final_data = edited_df[edited_df["選取"] == True]
+            # (這裡簡化 HTML 生成邏輯，您可以把之前美美的 HTML 貼回來)
+            html = final_data.to_html() 
+            st.download_button("下載報表", html, "report.html")
+
+# --- 功能 2: 證件辨識 ---
 else:
-    target_type = doc_map[app_mode]
-    st.title(app_mode + " (V10.5 樣本修正版)")
-    uploaded_file = st.file_uploader(f"請上傳 {app_mode.split(' ')[1]}", type=['png', 'jpg', 'jpeg'])
-
+    st.title("🪪 證件辨識 (支援樣本圖)")
+    doc_type_ui = st.selectbox("證件類型", ["身分證 (自動正反)", "護照"])
+    doc_map = {"身分證 (自動正反)": "id_card", "護照": "passport"}
+    
+    uploaded_file = st.file_uploader("上傳證件", type=['png', 'jpg', 'jpeg'])
+    
     if uploaded_file:
         image = Image.open(uploaded_file)
-        processed_image = preprocess_image(image)
-        c1, c2 = st.columns(2)
-        c1.image(image, caption='原始照片')
-        c2.image(processed_image, caption='V10 處理後')
+        
+        # 樣本圖特殊處理開關
+        use_filter = st.checkbox("開啟紅字濾鏡 (針對網路樣本)", value=True)
+        
+        if use_filter:
+            # 針對紅色樣本，用紅光濾鏡處理後再辨識
+            proc_img = preprocess_image_gamma(image)
+            st.image(proc_img, caption="預處理後 (過濾紅章)", width=400)
+            target_img = proc_img
+        else:
+            st.image(image, caption="原始圖", width=400)
+            target_img = image
 
-        if st.button("🔍 開始辨識"):
-            with st.spinner('正在分析...'):
-                raw_text = pytesseract.image_to_string(processed_image, lang='chi_tra+eng', config='--psm 6')
-                is_valid, status_or_msg = validate_image_content(raw_text, target_type)
+        if st.button("🚀 開始辨識"):
+            full_text, lines = run_ocr(target_img)
+            
+            data = extract_id_passport(full_text, lines, doc_map[doc_type_ui])
+            
+            st.success(f"辨識完成！類型: {data.get('type_label', '未知')}")
+            
+            with st.form("result"):
+                c1, c2 = st.columns(2)
+                if "name" in data: c1.text_input("姓名", data['name'])
+                if "eng_name" in data: c1.text_input("英文姓名", data['eng_name'])
+                if "id_no" in data: c2.text_input("身分證字號", data['id_no'])
+                if "dob" in data: st.text_input("生日", data['dob'])
+                if "address" in data: st.text_input("住址", data['address'])
+                if "passport_no" in data: c2.text_input("護照號碼", data['passport_no'])
                 
-                if not is_valid:
-                    st.error(status_or_msg)
-                else:
-                    specific_type = status_or_msg 
-                    st.success(f"✅ 成功識別！({specific_type})")
-                    data = extract_data(raw_text, target_type, specific_type)
-                    
-                    st.subheader(f"📝 {data.get('type_label', '結果')}")
-                    with st.form("result_form"):
-                        c1, c2 = st.columns(2)
-                        
-                        if specific_type == "id_card_front":
-                            c1.text_input("姓名", value=data.get('name', ''))
-                            c2.text_input("身分證字號", value=data.get('id_no', ''))
-                            st.text_input("出生年月日", value=data.get('dob', ''))
-
-                        elif specific_type == "id_card_back":
-                            st.text_input("住址", value=data.get('address', ''))
-                            c1.text_input("父親", value=data.get('father', ''))
-                            c2.text_input("母親", value=data.get('mother', ''))
-                            st.text_input("配偶", value=data.get('spouse', ''))
-                            
-                        elif target_type == "health_card":
-                            c1.text_input("姓名", value=data.get('name', ''))
-                            c2.text_input("身分證字號", value=data.get('id_no', ''))
-                            st.text_input("健保卡號", value=data.get('card_no', ''))
-                            
-                        elif target_type == "passport":
-                            c1.text_input("英文姓名", value=data.get('eng_name', ''))
-                            c2.text_input("護照號碼", value=data.get('passport_no', ''))
-                            st.text_input("身分證字號", value=data.get('id_no', ''))
-
-                        st.form_submit_button("💾 確認存檔")
+                st.form_submit_button("存檔")
                 
-                with st.expander("🛠️ 查看原始 OCR 文字"):
-                    st.text_area("Raw Text", raw_text, height=200)
+            with st.expander("查看原始文字"):
+                st.text(full_text)
