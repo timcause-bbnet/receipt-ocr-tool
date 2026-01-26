@@ -16,36 +16,38 @@ else:
     if tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-st.set_page_config(page_title="全能證件辨識 (V6.0 濾鏡全開)", layout="wide", page_icon="🕵️")
+st.set_page_config(page_title="全能證件辨識 (V7.0 最終修正)", layout="wide", page_icon="🕵️")
 
 # ==========================================
-# 📷 影像預處理 (紅光濾鏡技術)
+# 📷 影像預處理 (V7: 紅色通道 + 強制黑白化)
 # ==========================================
 def preprocess_image(image):
-    # 1. 確保是 RGB 模式
+    # 1. 確保 RGB
     if image.mode != 'RGB':
         image = image.convert('RGB')
         
-    # 2. 【核心密技】分離通道，只取「紅色通道 (R)」
-    # 原理：紅色的浮水印/印章在紅色通道下會變得很亮(接近白)，黑字則保持黑
+    # 2. 分離通道，只取紅色通道 (R) 以過濾紅色印章
     r, g, b = image.split()
     
-    # 3. 放大 2 倍 (LANCZOS 高品質放大)
-    new_size = (int(r.width * 2), int(r.height * 2))
-    img_resized = r.resize(new_size, Image.Resampling.LANCZOS)
+    # 3. 【關鍵修正】自動色階 (AutoContrast)
+    #這一步會把變淡的灰字，重新拉回深黑色
+    img_contrasted = ImageOps.autocontrast(r, cutoff=2)
     
-    # 4. 對比度增強 (讓黑字更深)
-    enhancer = ImageEnhance.Contrast(img_resized)
-    img_final = enhancer.enhance(2.0)
+    # 4. 放大 2 倍
+    new_size = (int(img_contrasted.width * 2), int(img_contrasted.height * 2))
+    img_resized = img_contrasted.resize(new_size, Image.Resampling.LANCZOS)
     
-    # 5. 稍微銳利化
-    enhancer_sharp = ImageEnhance.Sharpness(img_final)
-    img_final = enhancer_sharp.enhance(1.2)
+    # 5. 【關鍵修正】二值化閥值 (Threshold)
+    # 強制將灰度低於 160 的像素轉為全黑，高於的轉全白
+    # 這能去除殘留的底紋，只留下骨幹
+    threshold = 160
+    fn = lambda x : 0 if x < threshold else 255
+    img_binary = img_resized.point(fn, mode='1')
 
-    return img_final
+    return img_binary
 
 # ==========================================
-# 核心邏輯：驗證
+# 核心邏輯：防呆驗證
 # ==========================================
 def validate_image_content(text, doc_type):
     clean_text = re.sub(r'\s+', '', text).upper()
@@ -62,8 +64,11 @@ def validate_image_content(text, doc_type):
         return False, "⚠️ 讀取不到護照特徵"
 
     elif doc_type == "id_card":
-        if re.search(r'[A-Z][12]\d{8}', clean_text) or \
-           any(x in clean_text for x in ["身分證", "出生", "性別", "統一編號"]):
+        # 如果有讀到身分證字號，直接通過，不用管其他關鍵字 (最強特徵)
+        if re.search(r'[A-Z][12]\d{8}', clean_text):
+            return True, "id_card_front"
+            
+        if any(x in clean_text for x in ["身分證", "出生", "性別", "統一編號"]):
             return True, "id_card_front"
         
         # 背面特徵
@@ -73,14 +78,14 @@ def validate_image_content(text, doc_type):
             
         if "健保" in clean_text: return False, "⚠️ 錯誤：這是【健保卡】"
         
-        if len(clean_text) > 10:
-             return False, f"⚠️ 特徵不足 (命中數:{hit_count})。請嘗試避開浮水印或反光。"
+        if len(clean_text) > 5:
+             return False, f"⚠️ 特徵不足 (命中數:{hit_count})。請嘗試避開反光。"
         return False, "⚠️ 讀不到文字"
 
     return True, doc_type
 
 # ==========================================
-# 核心邏輯：資料提取
+# 核心邏輯：資料提取 (Regex 修正)
 # ==========================================
 def extract_data(text, doc_type, specific_type=None):
     raw_text = text
@@ -89,16 +94,12 @@ def extract_data(text, doc_type, specific_type=None):
 
     if doc_type == "id_card":
         if specific_type == "id_card_front":
-            # 1. 姓名 (針對有"樣本"干擾的狀況優化)
-            # 策略：抓取 "姓名" 後面的字，但排除 "樣本"、"樣"、"本"
+            # 1. 姓名
             name_match = re.search(r'姓\s*名[:\s\.]*([\u4e00-\u9fa5\s]{2,10})', raw_text)
             if name_match:
                 raw_name = name_match.group(1).replace(" ", "").replace("\n", "")
-                # 過濾掉浮水印常見字
-                filtered_name = raw_name.replace("樣本", "").replace("樣", "").replace("本", "")
-                data['name'] = filtered_name
+                data['name'] = raw_name.replace("樣本", "").replace("樣", "").replace("本", "")
             else:
-                # 備用：掃描前幾行
                 lines = raw_text.split('\n')
                 for line in lines[:6]:
                     c_line = re.sub(r'[^\u4e00-\u9fa5]', '', line) 
@@ -110,22 +111,17 @@ def extract_data(text, doc_type, specific_type=None):
             id_match = re.search(r'[A-Z][12]\d{8}', clean_text_nospace)
             data['id_no'] = id_match.group(0) if id_match else ""
 
-            # 3. 生日 (紅色濾鏡後，這裡應該能讀到了)
+            # 3. 生日
             date_pattern = r'(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日'
             all_dates = []
-            
-            # 使用 Regex 掃描所有日期
             for match in re.finditer(date_pattern, raw_text):
                 y, m, d = match.groups()
-                # 簡單驗證：年份要在合理範圍 (例如 10~100) 且不能太大 (大於 100 可能是發證日)
-                # 但為了保險，我們還是存下來排序
                 all_dates.append({
                     "str": f"民國{y}年{m}月{d}日",
                     "val": int(y)*10000 + int(m)*100 + int(d)
                 })
             
             if all_dates:
-                # 生日一定是最小的那個數字 (例如 57 < 94)
                 all_dates.sort(key=lambda x: x['val'])
                 data['dob'] = all_dates[0]['str']
             else:
@@ -134,7 +130,7 @@ def extract_data(text, doc_type, specific_type=None):
             data['type_label'] = "身分證 (正面)"
 
         elif specific_type == "id_card_back":
-            # 背面邏輯維持不變 (上版已修復)
+            # 背面邏輯
             addr_match = re.search(r'址[:\s\.]*([\u4e00-\u9fa50-9\-\(\)鄰里巷弄號樓\s]+)', raw_text)
             if addr_match:
                 data['address'] = addr_match.group(1).replace(" ", "").replace("\n", "")
@@ -165,8 +161,13 @@ def extract_data(text, doc_type, specific_type=None):
     elif doc_type == "passport":
         pass_match = re.search(r'[0-9]{9}', clean_text_nospace)
         id_match = re.search(r'[A-Z][12]\d{8}', clean_text_nospace)
-        eng_match = re.search(r'([A-Z]+,\s?[A-Z\-]+)', raw_text)
-        data['eng_name'] = eng_match.group(1).replace("\n", "") if eng_match else ""
+        
+        # 【關鍵修正】護照姓名 Regex
+        # 原本: ([A-Z]+,\s?[A-Z\-]+) -> 遇到空格會斷
+        # 修正: ([A-Z]+,\s*[-A-Z\s]+) -> 允許包含 空格 和 連字號，直到遇到換行或非大寫字
+        eng_match = re.search(r'([A-Z]+,\s*[-A-Z\s]+)', raw_text)
+        
+        data['eng_name'] = eng_match.group(1).replace("\n", "").strip() if eng_match else ""
         data['passport_no'] = pass_match.group(0) if pass_match else ""
         data['id_no'] = id_match.group(0) if id_match else ""
         data['type_label'] = "護照"
@@ -196,14 +197,14 @@ else:
     if uploaded_file:
         image = Image.open(uploaded_file)
         
-        # 顯示處理對比圖 (讓您見證紅色濾鏡的威力)
+        # 預覽處理結果
         processed_image = preprocess_image(image)
         c1, c2 = st.columns(2)
-        c1.image(image, caption='原始照片 (含紅字干擾)')
-        c2.image(processed_image, caption='紅色濾鏡+放大 (紅字消失，黑字保留)')
+        c1.image(image, caption='原始照片')
+        c2.image(processed_image, caption='V7 強化黑白 (去除淺灰雜訊)')
 
         if st.button("🔍 開始辨識"):
-            with st.spinner('紅光濾鏡分析中...'):
+            with st.spinner('AI 正在讀取...'):
                 # OCR
                 raw_text = pytesseract.image_to_string(processed_image, lang='chi_tra+eng', config='--psm 6')
                 
