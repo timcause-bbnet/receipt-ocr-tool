@@ -7,37 +7,18 @@ import re
 import cv2
 from opencc import OpenCC
 
+# 初始化簡轉繁
 cc = OpenCC('s2t')
 def to_traditional(text):
     return cc.convert(text)
 
-st.set_page_config(page_title="全能 OCR (V18 國際標準版)", layout="wide", page_icon="🌍")
+st.set_page_config(page_title="全能 OCR (V19 修復版)", layout="wide", page_icon="🌍")
 
 # ==========================================
-# 🌍 萬國證件設定檔 (優化關鍵字與權重)
+# 🌍 萬國證件設定檔 (修正關鍵字邏輯)
 # ==========================================
 DOCUMENT_CONFIG = [
-    # --- 台灣專區 ---
-    {
-        "id": "twn_id_front",
-        "label": "🇹🇼 台灣身分證 (正面)",
-        "keywords": ["中華民國", "國民身分證", "統一編號"], # 移除太通用的"出生"
-        "exclude": ["配偶", "役別", "USA", "UNITEDSTATES", "JAPAN", "CHINA"], # 排除外國關鍵字
-        "parser": "twn_id"
-    },
-    {
-        "id": "twn_id_back",
-        "label": "🇹🇼 台灣身分證 (背面)",
-        "keywords": ["配偶", "役別", "父母", "出生地", "住址"],
-        "parser": "twn_id_back"
-    },
-    {
-        "id": "twn_health",
-        "label": "🇹🇼 台灣健保卡",
-        "keywords": ["全民健康保險", "健保", "IC卡"],
-        "parser": "twn_health"
-    },
-    # --- 護照專區 (利用 MRZ 邏輯) ---
+    # --- 優先檢查護照 (權重高) ---
     {
         "id": "passport_twn",
         "label": "🇹🇼 台灣護照",
@@ -47,13 +28,14 @@ DOCUMENT_CONFIG = [
     {
         "id": "passport_chn",
         "label": "🇨🇳 中國護照",
-        "keywords": ["CHINA", "CHN", "PEOPLE", "REPUBLIC"], # 拆成單字
+        "#": "必須包含中文全名，防止誤判",
+        "keywords": ["中華人民共和國", "POEPLESREPUBLIC", "CHINA", "CHN"], 
         "parser": "universal_passport"
     },
     {
         "id": "passport_usa",
         "label": "🇺🇸 美國護照/卡",
-        "keywords": ["USA", "UNITEDSTATES", "AMERICA"],
+        "keywords": ["UNITEDSTATES", "AMERICA", "USA"],
         "parser": "universal_passport"
     },
     {
@@ -61,6 +43,28 @@ DOCUMENT_CONFIG = [
         "label": "🇯🇵 日本護照",
         "keywords": ["JAPAN", "JPN", "GAIMU"],
         "parser": "universal_passport"
+    },
+    # --- 台灣證件 ---
+    {
+        "id": "twn_health",
+        "label": "🇹🇼 台灣健保卡",
+        "keywords": ["全民健康保險", "健保", "IC卡"],
+        "parser": "twn_health"
+    },
+    {
+        "id": "twn_id_front",
+        "label": "🇹🇼 台灣身分證 (正面)",
+        "keywords": ["中華民國", "國民身分證", "統一編號"],
+        # 強力排除：只要出現這些國家字眼，絕對不是台灣身分證
+        "exclude": ["配偶", "役別", "USA", "UNITED", "JAPAN", "CHINA", "共和國", "PASSPORT"], 
+        "parser": "twn_id"
+    },
+    {
+        "id": "twn_id_back",
+        "label": "🇹🇼 台灣身分證 (背面)",
+        "keywords": ["配偶", "役別", "父母", "出生地", "住址"],
+        "exclude": ["PASSPORT", "共和國", "CHINA", "USA"], # 避免誤判中國護照
+        "parser": "twn_id_back"
     }
 ]
 
@@ -74,7 +78,6 @@ def load_engine():
 engine = load_engine()
 
 def preprocess_red_filter(image):
-    """紅光濾鏡"""
     if image.mode != 'RGB': image = image.convert('RGB')
     r, g, b = image.split()
     return r.point(lambda p: int(255 * (p / 255) ** 0.6))
@@ -85,7 +88,7 @@ def run_ocr(image_pil):
     result, _ = engine(img_cv)
     if not result: return "", []
     
-    # 轉繁體並保留原始行結構
+    # 轉繁體並去除空格，方便比對
     all_text = "\n".join([to_traditional(line[1]) for line in result])
     raw_lines = [to_traditional(line[1]) for line in result]
     return all_text, raw_lines
@@ -97,112 +100,115 @@ def detect_document_type(clean_text):
     best_match = None
     max_score = 0
     
-    # 1. 優先檢查是否為護照 (PASSPORT 權重最高)
-    is_passport = "PASSPORT" in clean_text
-    
     for doc in DOCUMENT_CONFIG:
         score = 0
-        # 排除機制
+        
+        # 1. 排除機制 (一票否決)
         if "exclude" in doc:
             if any(ex in clean_text for ex in doc["exclude"]):
                 continue
         
+        # 2. 計算關鍵字
         for kw in doc["keywords"]:
             if kw in clean_text:
                 score += 1
         
-        # 如果有 PASSPORT 字樣，護照類別加分
-        if is_passport and "passport" in doc["id"]:
-            score += 2
-            
+        # 3. 護照 MRZ 特徵加分 (P<TWN, P<JPN)
+        if "passport" in doc["id"] and ("P<" in clean_text or "PKA" in clean_text):
+             score += 1
+
         if score > max_score:
             max_score = score
             best_match = doc
             
-    # Fallback 機制 (修正：避免美國卡 V 開頭號碼誤判為台灣 ID)
+    # Fallback: 如果特徵不足，但有 ID 格式
     if not best_match:
-        # 只有在完全沒有 USA/CHINA/JAPAN 等外國關鍵字時，才允許用 Regex 猜台灣 ID
-        foreign_keys = ["USA", "UNITED", "JAPAN", "CHINA", "PEOPLE"]
-        if not any(k in clean_text for k in foreign_keys):
-            if re.search(r'[A-Z][12]\d{8}', clean_text):
-                return next((d for d in DOCUMENT_CONFIG if d["id"] == "twn_id_front"), None)
+        # 如果有 "共和國" 或 "CHINA"，強制轉中國護照 (修復誤判)
+        if "共和國" in clean_text or "CHINA" in clean_text:
+             return next((d for d in DOCUMENT_CONFIG if d["id"] == "passport_chn"), None)
+             
+        if re.search(r'[A-Z][12]\d{8}', clean_text):
+            return next((d for d in DOCUMENT_CONFIG if d["id"] == "twn_id_front"), None)
     
     return best_match
 
 # ==========================================
-# 📝 解析器 (Parser)
+# 📝 解析器 (補回 parse_mrz)
 # ==========================================
 
-# 1. MRZ 解析器 (護照神器) def parse_mrz(clean_text):
+def parse_mrz(clean_text):
     """
-    嘗試解析護照下方的 P<TWN... 或 P<JPN... 兩行代碼
-    這是最準確的資料來源
+    解析護照下方的機器讀碼區 (MRZ)
+    例如: P<JPNSAKURA<<GAIMU<<<<<<<<
     """
-    lines = clean_text.split('\n')
     mrz_data = {}
+    lines = clean_text.split('\n')
     
     for line in lines:
-        # 尋找 P<XXX 開頭的行
-        if line.startswith("P<") or line.startswith("PZM") or (len(line) > 30 and "<" in line):
-            # 這是 MRZ 第一行: P<TWNLIN<<MEI<HUA<<<<<<<<
-            # 提取名字: 去掉 P<XXX, 把 << 變成逗號
+        # 移除空格以便分析
+        l = line.replace(" ", "")
+        
+        # 抓名字 (第一行通常以 P, V, I 開頭，含有 <<)
+        if (l.startswith("P") or l.startswith("V") or l.startswith("I")) and "<<" in l:
+            # 找到國碼後的區塊 (P<TWN 或 P<JPN)
+            # 簡單暴力的解法：找第一個 < 之後的字
             try:
-                # 簡單提取邏輯：抓取兩個 < 之間或之後的文字
-                name_part = line[5:].replace("<", " ").strip()
-                mrz_data['eng_name'] = name_part
+                parts = l.split("<")
+                # 組合名字：通常是 Surname<<Given<Name
+                # 過濾掉空字串和國碼
+                valid_parts = [p for p in parts if len(p) > 2 and not any(c.isdigit() for c in p)]
+                if valid_parts:
+                    # 這是很粗略的抓法，但對大部分護照有效
+                    full_str = " ".join(valid_parts).replace("PASSPORT", "").strip()
+                    if len(full_str) > 3:
+                        mrz_data['eng_name'] = full_str
             except:
                 pass
                 
-        # 尋找含有大量數字和 < 的行 (第二行)
-        # 例如: 1234567897TWN880101...
-        if re.search(r'\d{7,}.*<', line):
-            # 提取護照號碼 (通常在前9碼)
-            pass_no = re.search(r'[A-Z0-9]{7,9}', line)
-            if pass_no:
-                mrz_data['passport_no'] = pass_no.group(0)
+        # 抓護照號碼 (通常在第二行，包含數字)
+        # 格式: 號碼 + 國碼 + 生日
+        # 尋找連續的數字與字母組合
+        pass_match = re.search(r'[A-Z0-9]{8,9}', l)
+        if pass_match and not "PASSPORT" in l:
+             # 簡單驗證：護照號碼通常會有數字
+             if any(c.isdigit() for c in pass_match.group(0)):
+                 mrz_data['passport_no'] = pass_match.group(0)
 
     return mrz_data
 
 def parse_universal_passport(clean_text, raw_lines):
-    """通用護照解析 (MRZ 優先 + 視覺備援)"""
+    """通用護照解析"""
     data = {}
     
-    # 策略 A: 先試著解 MRZ (最準)
+    # 1. 先用 MRZ 嘗試解析 (補回此功能)
     mrz_data = parse_mrz(clean_text)
     data.update(mrz_data)
     
-    # 策略 B: 視覺補充 (如果 MRZ 沒抓到)
-    
-    # 1. 護照號碼
+    # 2. 視覺解析 (備援)
     if "passport_no" not in data:
-        # 排除 "PASSPORT" 這個字被當成號碼
-        candidates = re.findall(r'[A-Z0-9]{7,9}', clean_text)
-        for cand in candidates:
-            if "PASSPORT" not in cand and "REPUBLIC" not in cand:
-                data['passport_no'] = cand
+        # 排除標題字
+        cands = re.findall(r'[A-Z0-9]{7,9}', clean_text)
+        for c in cands:
+            if "PASSPORT" not in c and "REPUBLIC" not in c and "CHINA" not in c:
+                data['passport_no'] = c
                 break
-    
-    # 2. 英文姓名
+                
     if "eng_name" not in data:
         for line in raw_lines:
-            # 規則：全大寫、長度夠、不是黑名單
+            # 找全大寫英文
             if re.search(r'[A-Z]', line) and len(line) > 3:
                 line_upper = line.upper()
-                # 黑名單擴充
-                blacklist = ["NAME", "SURNAME", "GIVEN", "MINISTRY", "REPUBLIC", "BIRTH", "PASSPORT", "JAPAN", "SEX", "TYPE", "CODE", "ISSUING", "AUTHORITY", "DATE", "NATIONALITY"]
+                blacklist = ["NAME", "SURNAME", "GIVEN", "MINISTRY", "REPUBLIC", "BIRTH", "PASSPORT", "JAPAN", "SEX", "TYPE", "CODE", "ISSUING", "AUTHORITY", "DATE", "NATIONALITY", "CHINESE", "AMERICA"]
                 if any(bad in line_upper for bad in blacklist): continue
                 if re.search(r'\d', line): continue 
                 
-                # 日本護照特徵：Surname 和 Given name 可能分行
-                # 如果有逗號最穩
                 if "," in line:
                     data['eng_name'] = line
                     break
-                
-                # 暫存可能是名字的行
-                if "eng_name" not in data: data['eng_name'] = line
+                if not data.get('eng_name'): 
+                    data['eng_name'] = line
 
-    # 3. 台灣身分證 (只有台灣護照有)
+    # 3. 台灣護照才有身分證
     if "TAIWAN" in clean_text:
         id_match = re.search(r'[A-Z][12]\d{8}', clean_text)
         data['id_no'] = id_match.group(0) if id_match else ""
@@ -237,11 +243,13 @@ def parse_twn_id_back(clean_text, raw_lines):
     data = {}
     addr = "".join([l for l in raw_lines if any(k in l for k in ["縣", "市", "區", "路", "街"])])
     data['address'] = addr.replace("住址", "")
+    
     parents = "".join([l for l in raw_lines if "父" in l or "母" in l])
     f = re.search(r'父\s*([\u4e00-\u9fa5]+)', parents)
     m = re.search(r'母\s*([\u4e00-\u9fa5]+)', parents)
     data['father'] = f.group(1) if f else ""
     data['mother'] = m.group(1) if m else ""
+    
     spouse = "".join([l for l in raw_lines if "配偶" in l])
     data['spouse'] = spouse.replace("配偶", "")
     return data
@@ -260,31 +268,12 @@ def parse_twn_health(clean_text, raw_lines):
     data['card_no'] = card_match.group(0) if card_match else ""
     return data
 
-def parse_chn_id(clean_text, raw_lines):
-    data = {}
-    id_match = re.search(r'\d{17}[\dXx]', clean_text)
-    data['id_no'] = id_match.group(0) if id_match else ""
-    for line in raw_lines:
-        if "姓名" in line:
-            data['name'] = line.replace("姓名", "").strip()
-            break
-    addr = ""
-    start = False
-    for line in raw_lines:
-        if "住址" in line:
-            start = True
-            addr += line.replace("住址", "")
-        elif "公民" in line: start = False
-        elif start: addr += line
-    data['address'] = addr
-    return data
-
+# Parser 路由
 PARSERS = {
     "twn_id": parse_twn_id,
     "twn_id_back": parse_twn_id_back,
     "twn_health": parse_twn_health,
-    "universal_passport": parse_universal_passport,
-    "chn_id": parse_chn_id
+    "universal_passport": parse_universal_passport
 }
 
 # ==========================================
@@ -323,7 +312,7 @@ def parse_easycard_func(text_lines):
     return data
 
 # ==========================================
-# 🖥️ 介面
+# 介面
 # ==========================================
 st.sidebar.title("🌍 萬國 OCR")
 app_mode = st.sidebar.radio("功能選單", ["💳 悠遊卡報表", "🪪 證件辨識 (自動多國)"])
@@ -341,7 +330,7 @@ if app_mode == "💳 悠遊卡報表":
             else: st.error("無資料")
 
 else:
-    st.title("🪪 智慧證件辨識 (國際強化版)")
+    st.title("🪪 智慧證件辨識 (V19 萬國修復版)")
     supported = ", ".join([d['label'] for d in DOCUMENT_CONFIG])
     st.caption(f"目前支援：{supported}")
     
@@ -352,15 +341,15 @@ else:
         st.image(image, caption="已上傳", width=400)
         
         if st.button("🚀 開始辨識"):
-            with st.spinner('AI 正在分析 MRZ 與 特徵...'):
+            with st.spinner('AI 正在分析...'):
                 full_text, lines = run_ocr(image)
                 clean_text = re.sub(r'[\s\.\-\_]+', '', full_text).upper().replace("O", "0").replace("I", "1").replace("L", "1")
                 
                 doc_conf = detect_document_type(clean_text)
                 
                 if not doc_conf:
-                    st.error("⚠️ 無法識別證件類型，請確認照片清晰度。")
-                    with st.expander("除錯資訊"): st.text(full_text)
+                    st.error("⚠️ 無法識別類型")
+                    with st.expander("除錯"): st.text(full_text)
                 else:
                     st.success(f"✅ 識別成功：{doc_conf['label']}")
                     parser_name = doc_conf['parser']
