@@ -5,6 +5,14 @@ import pandas as pd
 import numpy as np
 import re
 import cv2
+from opencc import OpenCC
+
+# 簡轉繁轉換器
+cc = OpenCC('s2t')
+
+def to_traditional(text):
+    """簡體轉繁體"""
+    return cc.convert(text)
 
 st.set_page_config(page_title="全能 OCR (V15 三卡完美版)", layout="wide", page_icon="🚀")
 
@@ -42,8 +50,9 @@ def run_ocr(image_pil):
     img_cv = pil_to_cv(image_pil)
     result, _ = engine(img_cv)
     if not result: return "", []
-    all_text = "\n".join([line[1] for line in result])
-    raw_lines = [line[1] for line in result]
+    # 簡轉繁處理
+    all_text = "\n".join([to_traditional(line[1]) for line in result])
+    raw_lines = [to_traditional(line[1]) for line in result]
     return all_text, raw_lines
 
 # ==========================================
